@@ -4094,6 +4094,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_merge_writes_plain_string_types_to_parquet() {
+        use object_store::ObjectStoreExt as _;
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+        let schema = get_arrow_schema(&None);
+        let table = setup_table(None).await;
+        let table = write_data(table, &schema).await;
+
+        let source_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", ArrowDataType::Utf8, true),
+            Field::new("value", ArrowDataType::Int32, true),
+            Field::new("modified", ArrowDataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            source_schema,
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["B", "X"])),
+                Arc::new(arrow::array::Int32Array::from(vec![10, 30])),
+                Arc::new(arrow::array::StringArray::from(vec![
+                    "2021-02-02",
+                    "2023-07-04",
+                ])),
+            ],
+        )
+        .unwrap();
+        let source = SessionContext::new().read_batch(batch).unwrap();
+
+        let (table, _) = table
+            .merge(source, col("target.id").eq(col("source.id")))
+            .with_source_alias("source")
+            .with_target_alias("target")
+            .when_matched_update(|update| update.update("value", col("source.value")))
+            .unwrap()
+            .when_not_matched_insert(|insert| {
+                insert
+                    .set("id", col("source.id"))
+                    .set("value", col("source.value"))
+                    .set("modified", col("source.modified"))
+            })
+            .unwrap()
+            .await
+            .unwrap();
+
+        let store = table.log_store().object_store();
+        let paths: Vec<_> = table
+            .snapshot()
+            .unwrap()
+            .log_data()
+            .into_iter()
+            .map(|add| add.object_store_path())
+            .collect();
+        assert!(!paths.is_empty());
+        for path in paths {
+            let bytes = store.get(&path).await.unwrap().bytes().await.unwrap();
+            let reader = ParquetRecordBatchReaderBuilder::try_new(bytes).unwrap();
+            for field in reader.schema().fields() {
+                assert!(
+                    !matches!(
+                        field.data_type(),
+                        ArrowDataType::Utf8View | ArrowDataType::BinaryView
+                    ),
+                    "{path} wrote {} as {}",
+                    field.name(),
+                    field.data_type()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_merge_with_schema_merge_partitioned_string_view_source() {
         let schema = get_arrow_schema(&None);
         let before_table = setup_table(Some(vec!["modified"])).await;

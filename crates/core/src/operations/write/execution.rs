@@ -1,12 +1,13 @@
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::{Arc, OnceLock};
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, FieldRef, Schema};
 use arrow_array::RecordBatch;
 use datafusion::catalog::Session;
 use datafusion::common::ToDFSchema;
 use datafusion::logical_expr::{Expr, col, lit, when};
-use datafusion::physical_expr::expressions::col as physical_col;
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::{CastExpr, col as physical_col};
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::{
@@ -441,6 +442,7 @@ pub(crate) async fn write_execution_plan_v2(
         contains_cdc,
         insert_marker_column.as_deref(),
     )?;
+    let plan = cast_view_types_to_plain(plan)?;
     let sink_config = WriteSinkConfig::new(table_config, object_store, props);
 
     if !contains_cdc {
@@ -448,6 +450,57 @@ pub(crate) async fn write_execution_plan_v2(
     } else {
         write_cdc_plan(session, plan, sink_config).await
     }
+}
+
+/// The type with any `Utf8View` / `BinaryView` (including nested ones) replaced by `Utf8` /
+/// `Binary`, or `None` if it contains no view types.
+fn plain_type(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        DataType::Utf8View => Some(DataType::Utf8),
+        DataType::BinaryView => Some(DataType::Binary),
+        DataType::List(f) => plain_field(f).map(DataType::List),
+        DataType::LargeList(f) => plain_field(f).map(DataType::LargeList),
+        DataType::Struct(fields) => {
+            if !fields.iter().any(|f| plain_field(f).is_some()) {
+                return None;
+            }
+            Some(DataType::Struct(
+                fields
+                    .iter()
+                    .map(|f| plain_field(f).unwrap_or_else(|| f.clone()))
+                    .collect(),
+            ))
+        }
+        DataType::Map(f, sorted) => plain_field(f).map(|f| DataType::Map(f, *sorted)),
+        _ => None,
+    }
+}
+
+fn plain_field(field: &FieldRef) -> Option<FieldRef> {
+    plain_type(field.data_type()).map(|dt| Arc::new(field.as_ref().clone().with_data_type(dt)))
+}
+
+/// DataFusion reads strings as view types (`schema_force_view_types`), which would otherwise be
+/// persisted in the parquet `ARROW:schema` metadata and break later pyarrow filtered reads
+/// (`string` vs `string_view`). Cast them back to the plain Arrow types, as other write paths do.
+fn cast_view_types_to_plain(plan: Arc<dyn ExecutionPlan>) -> DeltaResult<Arc<dyn ExecutionPlan>> {
+    let schema = plan.schema();
+    if !schema.fields().iter().any(|f| plain_field(f).is_some()) {
+        return Ok(plan);
+    }
+    let expressions: Vec<_> = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let expr = physical_col(field.name(), &schema)?;
+            let expr: Arc<dyn PhysicalExpr> = match plain_type(field.data_type()) {
+                Some(dt) => Arc::new(CastExpr::new(expr, dt, None)),
+                None => expr,
+            };
+            Ok((expr, field.name().clone()))
+        })
+        .collect::<DeltaResult<_>>()?;
+    Ok(Arc::new(ProjectionExec::try_new(expressions, plan)?))
 }
 
 fn drop_internal_column(
