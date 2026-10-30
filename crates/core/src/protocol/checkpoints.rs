@@ -1,5 +1,6 @@
 //! Implementation for writing delta checkpoints.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use delta_kernel::last_checkpoint_hint::LastCheckpointHint;
@@ -19,6 +20,40 @@ use crate::{DeltaTable, open_table_with_version};
 
 static CHECKPOINT_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"_delta_log/(\d{20})\.(checkpoint).*$").unwrap());
+
+static MULTI_PART_CHECKPOINT_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"_delta_log/(\d{20})\.checkpoint\.(\d{10})\.(\d{10})\.parquet$").unwrap()
+});
+
+/// Returns the versions of checkpoints that readers can use.
+///
+/// A multi-part checkpoint is only usable when all of its parts are present; readers ignore
+/// incomplete ones, so cleanup must not treat them as a boundary.
+fn complete_checkpoint_versions<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<Version> {
+    let mut complete = Vec::new();
+    let mut multi_part: HashMap<(Version, u64), HashSet<u64>> = HashMap::new();
+    for path in paths {
+        if let Some(caps) = MULTI_PART_CHECKPOINT_REGEX.captures(path) {
+            let (Ok(ver), Ok(part), Ok(total)) = (
+                caps[1].parse::<Version>(),
+                caps[2].parse::<u64>(),
+                caps[3].parse::<u64>(),
+            ) else {
+                continue;
+            };
+            multi_part.entry((ver, total)).or_default().insert(part);
+        } else if let Some(ver) = CHECKPOINT_REGEX
+            .captures(path)
+            .and_then(|caps| caps[1].parse::<Version>().ok())
+        {
+            complete.push(ver);
+        }
+    }
+    complete.extend(multi_part.into_iter().filter_map(|((ver, total), parts)| {
+        (parts.len() as u64 == total && (1..=total).all(|p| parts.contains(&p))).then_some(ver)
+    }));
+    complete
+}
 
 /// Creates checkpoint for a given table version, table state and object store
 ///
@@ -176,18 +211,15 @@ pub async fn cleanup_expired_logs_for(
     keep_version = keep_version.min(min_retention_version);
 
     // Step 3: Find safe checkpoint with checkpoint_version <= keep_version (no ts restriction)
-    let safe_checkpoint_version_opt = log_entries
-        .iter()
-        .filter_map(|m| m.as_ref().ok())
-        .filter_map(|m| {
-            let path = m.location.as_ref();
-            CHECKPOINT_REGEX
-                .captures(path)
-                .and_then(|caps| caps.get(1))
-                .and_then(|v| v.as_str().parse::<Version>().ok())
-        })
-        .filter(|ver| *ver <= keep_version)
-        .max();
+    let safe_checkpoint_version_opt = complete_checkpoint_versions(
+        log_entries
+            .iter()
+            .filter_map(|m| m.as_ref().ok())
+            .map(|m| m.location.as_ref()),
+    )
+    .into_iter()
+    .filter(|ver| *ver <= keep_version)
+    .max();
 
     // Exit if no safe_checkpoint file was found.
     let Some(safe_checkpoint_version) = safe_checkpoint_version_opt else {
@@ -273,6 +305,23 @@ mod tests {
             Err(err) => return Err(err.into()),
         };
         Ok(parse_last_checkpoint_hint(&data))
+    }
+
+    #[test]
+    fn test_complete_checkpoint_versions_ignores_incomplete_multi_part() {
+        let p = |v: u64, part: u64, total: u64| {
+            format!("_delta_log/{v:020}.checkpoint.{part:010}.{total:010}.parquet")
+        };
+        let paths = [
+            p(2, 1, 2),
+            p(4, 1, 2),
+            p(4, 2, 2),
+            format!("_delta_log/{:020}.checkpoint.parquet", 6),
+            format!("_delta_log/{:020}.json", 7),
+        ];
+        let mut got = complete_checkpoint_versions(paths.iter().map(String::as_str));
+        got.sort();
+        assert_eq!(got, vec![4, 6]);
     }
 
     #[test]
