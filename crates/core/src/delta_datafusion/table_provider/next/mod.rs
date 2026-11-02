@@ -1211,6 +1211,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_equal_float_bounds_do_not_overwrite_nan_rows() -> TestResult {
+        let table = crate::DeltaTable::new_in_memory()
+            .create()
+            .with_columns([StructField::new(
+                "f".to_string(),
+                DataType::Primitive(PrimitiveType::Double),
+                true,
+            )])
+            .await?;
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![ArrowField::new(
+                "f",
+                ArrowDataType::Float64,
+                true,
+            )])),
+            vec![Arc::new(arrow::array::Float64Array::from(vec![
+                f64::NAN,
+                9.0,
+            ]))],
+        )?;
+        let table = table.write(vec![batch]).await?;
+
+        let provider = DeltaScan::builder()
+            .with_log_store(table.log_store())
+            .await?;
+        let session = Arc::new(create_session().into_inner());
+        session.register_table("t", provider)?;
+        let batches = session
+            .sql("SELECT f FROM t WHERE f = 9.0")
+            .await?
+            .collect()
+            .await?;
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(rows, 1, "NaN row must not match f = 9.0: {batches:?}");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_insert_into_append_works() -> TestResult {
         let table = create_in_memory_id_table().await?;
         let log_store = table.log_store();

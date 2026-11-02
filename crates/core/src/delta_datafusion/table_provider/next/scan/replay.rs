@@ -363,6 +363,12 @@ fn extract_precision(data: &Option<StructData>, name: impl AsRef<str>) -> Precis
     if let Some(field_index) = data.as_ref().and_then(|v| v.index_of(name.as_ref())) {
         data.as_ref()
             .map(|v| match to_datafusion_scalar(&v.values()[field_index]) {
+                // Parquet leaves NaN out of float min/max, so the bounds may not cover every
+                // row. Marking them exact lets DataFusion treat a column with equal bounds as
+                // a constant and overwrite the NaN rows.
+                Ok(df @ (ScalarValue::Float32(_) | ScalarValue::Float64(_))) => {
+                    Precision::Inexact(df)
+                }
                 Ok(df) => Precision::Exact(df),
                 _ => Precision::Absent,
             })
@@ -543,7 +549,35 @@ mod tests {
     use delta_kernel::scan::state::{DvInfo, ScanFile};
     use url::Url;
 
-    use super::{ScanContext, visit_scan_file};
+    use datafusion::common::stats::Precision;
+    use datafusion::scalar::ScalarValue;
+    use delta_kernel::expressions::{Scalar, StructData};
+    use delta_kernel::schema::{DataType, StructField};
+
+    use super::{ScanContext, extract_precision, visit_scan_file};
+
+    fn stats_for(field: &str, dt: DataType, value: Scalar) -> Option<StructData> {
+        Some(StructData::try_new(vec![StructField::nullable(field, dt)], vec![value]).unwrap())
+    }
+
+    #[test]
+    fn test_extract_precision_float_bounds_are_inexact() {
+        let f64_stats = stats_for("f", DataType::DOUBLE, Scalar::Double(9.0));
+        assert_eq!(
+            extract_precision(&f64_stats, "f"),
+            Precision::Inexact(ScalarValue::Float64(Some(9.0)))
+        );
+        let f32_stats = stats_for("f", DataType::FLOAT, Scalar::Float(9.0));
+        assert_eq!(
+            extract_precision(&f32_stats, "f"),
+            Precision::Inexact(ScalarValue::Float32(Some(9.0)))
+        );
+        let int_stats = stats_for("i", DataType::INTEGER, Scalar::Integer(9));
+        assert_eq!(
+            extract_precision(&int_stats, "i"),
+            Precision::Exact(ScalarValue::Int32(Some(9)))
+        );
+    }
 
     fn scan_file(path: impl Into<String>) -> ScanFile {
         ScanFile {
